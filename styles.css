@@ -58,6 +58,9 @@ body.chat-page { display:block; padding:0; }
 .chat-key-input { display:block; width:100%; min-height:46px; padding:11px 12px; border:1px solid #3a454d; border-radius:7px; background:#101518; color:var(--text); font:500 .9rem/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
 .chat-key-actions { display:flex; flex-wrap:wrap; gap:9px; margin-top:14px; }
 .chat-key-actions button { width:100%; }
+.chat-key-secondary-actions { margin-top:10px; text-align:center; }
+.chat-key-continue { min-height:32px; padding:5px 9px; border-color:#754343; background:#382426; color:#ed9e9e; font-size:.78rem; }
+.chat-key-continue:hover { border-color:#9a5555; background:#4a2b2d; }
 .chat-key-controls { margin:0 12px 10px; }
 .chat-key-controls button { width:100%; min-height:34px; padding:6px 8px; color:var(--muted); font-size:.78rem; }
 .chat-key-status { min-height:1.4em; margin:14px 0 0 !important; color:#c7d4dc !important; font-size:.84rem !important; }

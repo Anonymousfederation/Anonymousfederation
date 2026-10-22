@@ -55,6 +55,7 @@ const CHAT_KEY_RECORD_ID = "shared-chat-v2";
 const CHAT_CIPHERTEXT_PREFIX = "enc:v1:";
 const CHAT_KEY_KDF_SALT = new TextEncoder().encode("my-site:chat:shared-key:v2");
 let chatCryptoKey = null;
+let chatEncryptionEnabled = true;
 
 function bytesToBase64Url(bytes) {
     let binary = "";
@@ -172,11 +173,17 @@ function promptForChatKey() {
                 '<input id="chatKeyInput" class="chat-key-input" type="password" maxlength="18" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Enter the 18-character shared key">' +
                 '<div class="chat-key-actions"><button type="button" id="chatKeyUnlock">Unlock chat</button></div>' +
                 '<p class="chat-key-status" id="chatKeyStatus" role="status" aria-live="polite"></p>' +
+                '<div class="chat-key-secondary-actions"><button type="button" class="chat-key-continue" id="chatKeyContinue">Continue without encryption...</button></div>' +
             '</section>';
         document.body.append(overlay);
         const keyInput = overlay.querySelector("#chatKeyInput");
         const status = overlay.querySelector("#chatKeyStatus");
         let busy = false;
+        overlay.querySelector("#chatKeyContinue").addEventListener("click", () => {
+            if (busy) return;
+            chatEncryptionEnabled = false;
+            finish(null);
+        });
         const finish = key => {
             keyInput.value = "";
             overlay.remove();
@@ -248,6 +255,7 @@ async function decryptChatMessage(value, chat, currentUserId) {
         return { text: storedValue, legacy: true };
     }
     try {
+        if (!chatCryptoKey) return { text: "Encrypted message. Enter the shared key to read.", error: true };
         const payload = JSON.parse(storedValue.slice(CHAT_CIPHERTEXT_PREFIX.length));
         if (!payload || payload.v !== 1 || payload.alg !== "AES-256-GCM") throw new Error("Unsupported format");
         const iv = base64UrlToBytes(payload.iv, 12);
@@ -296,6 +304,14 @@ async function logAction(action) {
 }
 
 let profile = null;
+let aiConversation = [];
+let aiRequestInProgress = false;
+
+if (document.getElementById("email")) {
+    supabaseClient.auth.getSession().then(({ data: { session } }) => {
+        if (session) window.location.replace("dashboard.html");
+    });
+}
 
 async function login() {
 
@@ -432,6 +448,157 @@ loadPage(
 
 }
 
+function canUseAI() {
+    const aplfLevel = profile?.aplf_level;
+    if (!profile || aplfLevel === null || aplfLevel === undefined || String(aplfLevel).trim() === "") return false;
+    const level = Number(aplfLevel);
+    return Number.isFinite(level) && level > -1;
+}
+function ensureAIStyles() {
+    if (document.getElementById("aiAssistantStyles")) return;
+    const style = document.createElement("style");
+    style.id = "aiAssistantStyles";
+    style.textContent = [
+        ".ai-panel { display:flex; max-width:900px; height:min(78dvh,760px); min-height:420px; flex-direction:column; gap:12px; margin:0 auto; padding:20px; border:1px solid #303940; border-radius:12px; background:#191f24; }",
+        ".ai-panel h1 { margin:0; color:#e7eaec; font-size:1.5rem; }",
+        ".ai-status { margin:0; color:#929da5; font-size:.82rem; }",
+        ".ai-messages { display:flex; min-height:0; flex:1; flex-direction:column; gap:10px; overflow-y:auto; padding:12px; border:1px solid #303940; border-radius:8px; background:#101518; }",
+        ".ai-message { max-width:85%; padding:9px 12px; border:1px solid #303940; border-radius:9px; color:#e7eaec; line-height:1.5; overflow-wrap:anywhere; white-space:pre-wrap; }",
+        ".ai-message--user { align-self:flex-end; border-color:#3b535f; background:#263a46; }",
+        ".ai-message--assistant { align-self:flex-start; background:#20272d; }",
+        ".ai-composer { display:flex; gap:9px; }",
+        ".ai-composer input { min-width:0; height:44px; flex:1; padding:0 12px; border:1px solid #343e45; border-radius:7px; background:#101518; color:#e7eaec; font:400 .95rem Arial,sans-serif; }",
+        ".ai-composer button { min-width:78px; }",
+        "@media (max-width:640px) { .ai-panel { height:calc(100dvh - 90px); min-height:360px; padding:12px; } .ai-message { max-width:94%; } .ai-composer input { font-size:16px; } }"
+    ].join("\n");
+    document.head.append(style);
+}
+
+function appendAIMessage(role, text) {
+    const messages = document.getElementById("aiMessages");
+    if (!messages) return null;
+    const bubble = document.createElement("div");
+    bubble.className = "ai-message ai-message--" + role;
+    bubble.textContent = text;
+    messages.append(bubble);
+    messages.scrollTop = messages.scrollHeight;
+    return bubble;
+}
+
+async function loadAI() {
+    if (!canUseAI()) return;
+
+    const { data: { user } } = await supabaseClient.auth.getUser();
+    if (!user) {
+        window.location.replace("index.html");
+        return;
+    }
+
+    const { data: { session } } = await supabaseClient.auth.getSession();
+    if (!session) {
+        window.location.replace("index.html");
+        return;
+    }
+
+    resetChatPageLayout();
+    const dailyLimit = profile.premium_user === true ? 25 : 5;
+    document.getElementById("content").innerHTML =
+        '<section class="ai-panel" aria-labelledby="aiTitle">' +
+            '<h1 id="aiTitle">AI assistant</h1>' +
+            '<p id="aiStatus" class="ai-status"></p>' +
+            '<div id="aiMessages" class="ai-messages" role="log" aria-live="polite"></div>' +
+            '<form id="aiComposer" class="ai-composer">' +
+                '<input id="aiInput" type="text" maxlength="2000" placeholder="Ask a question..." aria-label="Ask the AI assistant" autocomplete="off">' +
+                '<button id="aiSendButton" type="submit">Send</button>' +
+            '</form>' +
+        '</section>';
+
+    const status = document.getElementById("aiStatus");
+    status.textContent = "You can send up to " + dailyLimit +
+        " messages per day. Your chat is not saved to your site account; the limit resets at midnight UTC.";
+    aiConversation.forEach(message => appendAIMessage(message.role, message.content));
+    document.getElementById("aiComposer").addEventListener("submit", sendAIMessage);
+}
+
+async function sendAIMessage(event) {
+    event.preventDefault();
+    if (aiRequestInProgress || !canUseAI()) return;
+
+    const input = document.getElementById("aiInput");
+    const sendButton = document.getElementById("aiSendButton");
+    const message = input.value.trim();
+    if (!message) return;
+
+    const { data: { user } } = await supabaseClient.auth.getUser();
+    if (!user) {
+        window.location.replace("index.html");
+        return;
+    }
+    const { data: { session } } = await supabaseClient.auth.getSession();
+    if (!session) {
+        window.location.replace("index.html");
+        return;
+    }
+
+    aiRequestInProgress = true;
+    sendButton.disabled = true;
+    appendAIMessage("user", message);
+    input.value = "";
+    const responseBubble = appendAIMessage("assistant", "Thinking...");
+
+    try {
+        const response = await fetch(SUPABASE_URL + "/functions/v1/ai-chat", {
+            method: "POST",
+            headers: {
+                Authorization: "Bearer " + session.access_token,
+                apikey: SUPABASE_ANON_KEY,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                message,
+                history: aiConversation.slice(-10)
+            })
+        });
+        const result = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            if (response.status === 401) {
+                window.location.replace("index.html");
+                return;
+            }
+            if (response.status === 429 && result.reason === "daily_limit") {
+                responseBubble.textContent = "You have used all " +
+                    result.daily_limit + " AI messages for today. The limit resets at midnight UTC.";
+                document.getElementById("aiStatus").textContent =
+                    "0 of " + result.daily_limit + " messages remaining today.";
+                return;
+            }
+            if (response.status === 403) {
+                responseBubble.textContent = "AI access is not available for this account.";
+                return;
+            }
+            responseBubble.textContent = "The AI could not reply. Your submitted message may have used a daily slot.";
+            return;
+        }
+
+        if (typeof result.reply !== "string" || !result.reply) {
+            throw new Error("Empty AI response");
+        }
+        responseBubble.textContent = result.reply;
+        aiConversation.push(
+            { role: "user", content: message },
+            { role: "assistant", content: result.reply }
+        );
+        document.getElementById("aiStatus").textContent =
+            result.remaining + " of " + result.daily_limit + " messages remaining today. Resets at midnight UTC.";
+    } catch (error) {
+        responseBubble.textContent = "The AI could not reply. Your submitted message may have used a daily slot.";
+    } finally {
+        aiRequestInProgress = false;
+        if (sendButton.isConnected) sendButton.disabled = false;
+        if (input.isConnected) input.focus();
+    }
+}
 async function initDashboard() {
 
 const {
@@ -566,6 +733,18 @@ if (menuButton && menu) {
     );
 }
 
+if (canUseAI()) {
+    ensureAIStyles();
+    const menu = document.getElementById("menu");
+    if (menu && !document.getElementById("aiButton")) {
+        const aiButton = document.createElement("button");
+        aiButton.id = "aiButton";
+        aiButton.type = "button";
+        aiButton.textContent = "AI Assistant";
+        aiButton.addEventListener("click", loadAI);
+        menu.insertBefore(aiButton, document.getElementById("adminButton"));
+    }
+}
 if (profile.aplf_level >= 1) {
 
     const aplfButton =
@@ -1142,7 +1321,7 @@ async function sendMessage() {
     const input = document.getElementById("chatInput");
     const sendButton = document.getElementById("sendChatButton");
     const text = input.value.trim();
-    if (!text || !chatCryptoKey) return;
+    if (!text || (chatEncryptionEnabled && !chatCryptoKey)) return;
     const { data: { session } } = await supabaseClient.auth.getSession();
     const { data: { user } } = await supabaseClient.auth.getUser();
     if (!session || !user) {
@@ -1151,7 +1330,9 @@ async function sendMessage() {
     }
     sendButton.disabled = true;
     try {
-        const encryptedMessage = await encryptChatMessage(text, selectedChat, user.id);
+        const message = chatEncryptionEnabled
+            ? await encryptChatMessage(text, selectedChat, user.id)
+            : text;
         const response = await fetch(
             "https://kgscurlvuevcpkaxdxur.supabase.co/functions/v1/send-message",
             {
@@ -1162,7 +1343,7 @@ async function sendMessage() {
                 },
                 body: JSON.stringify({
                     recipient_id: selectedChat.type === "global" ? null : selectedChat.id,
-                    message_text: encryptedMessage
+                    message_text: message
                 })
             }
         );
